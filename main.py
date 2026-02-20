@@ -34,7 +34,7 @@ OPENROUTER_HEADERS = {
     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
     "Content-Type": "application/json",
     "HTTP-Referer": "https://github.com/lobster-bot",
-    "X-Title": "二號龍蝦 Telegram Bot",
+   "X-Title": "Lobster Bot 2",
 }
 
 # ─── 模型定義 ───────────────────────────────────────────────
