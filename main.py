@@ -1,6 +1,6 @@
 """
 二號龍蝦 — Telegram AI 聊天機械人
-透過 OpenRouter API 接入 GLM-4 / Claude Opus 4.5
+透過 OpenRouter API 接入 z-ai/glm-5 / Claude Opus 4.6
 """
 
 import os
@@ -40,12 +40,12 @@ OPENROUTER_HEADERS = {
 # ─── 模型定義 ───────────────────────────────────────────────
 MODELS = {
     "glm": {
-        "id": "z-ai/glm-4.7",
-        "name": "GLM-4（智譜）",
+        "id": "z-ai/glm-5",
+        "name": "GLM-5（智譜）",
     },
     "opus": {
-        "id": "anthropic/claude-opus-4.5",
-        "name": "Claude Opus 4.5",
+        "id": "anthropic/claude-opus-4.6",
+        "name": "Claude Opus 4.6",
     },
 }
 DEFAULT_MODEL = "glm"
@@ -131,8 +131,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🦞 *你好！我係「二號龍蝦」！*\n\n"
         "我係一個 AI 聊天機械人，可以用廣東話同你傾偈 💬\n\n"
         "📌 *可用指令：*\n"
-        "• /glm — 切換到 GLM\\-4 模型（預設）\n"
-        "• /opus — 切換到 Claude Opus 4\\.5（處理困難任務）\n"
+        "• /glm — 切換到 GLM\\-5 模型（預設）\n"
+        "• /opus — 切換到 Claude Opus 4\\.6（處理困難任務）\n"
         "• /clear — 清除對話歷史，重新開始\n"
         "• /model — 查看而家用緊邊個模型\n"
         "• /help — 顯示呢個幫助訊息\n\n"
@@ -147,17 +147,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_glm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """處理 /glm 指令 — 切換到 GLM-4。"""
+    """處理 /glm 指令 — 切換到 GLM-5。"""
     user_id = update.effective_user.id
     user_models[user_id] = "glm"
     await update.message.reply_text(
-        "✅ 已經切換到 *GLM\\-4（智譜）* 模型！\n呢個係預設模型，適合日常對話。",
+        "✅ 已經切換到 *GLM\\-5（智譜）* 模型！\n呢個係預設模型，適合日常對話。",
         parse_mode="MarkdownV2",
     )
 
 
 async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """處理 /opus 指令 — 切換到 Claude Opus 4.5。"""
+    """處理 /opus 指令 — 切換到 Claude Opus 4.6。"""
     user_id = update.effective_user.id
     user_models[user_id] = "opus"
     await update.message.reply_text(
