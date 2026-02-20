@@ -1,11 +1,15 @@
 """
 二號龍蝦 — Telegram AI 聊天機械人
 透過 OpenRouter API 接入 GLM-5 / Claude Opus 4.6
+新增功能：SQLite 自動記憶、對話總結、記憶管理指令
 """
 
 import os
 import logging
+import sqlite3
+import json
 from collections import defaultdict
+from datetime import datetime
 
 import requests
 from telegram import Update
@@ -105,10 +109,194 @@ PROJECT_MEMORY = """以下係用戶正在進行嘅項目記憶，當用戶提及
 # ─── 對話上下文長度限制 ──────────────────────────────────────
 MAX_HISTORY_MESSAGES = 40
 
+# ─── SQLite 數據庫設定 ────────────────────────────────────────
+DB_FILE = "memory.db"
+
 # ─── 每個用戶嘅狀態 ─────────────────────────────────────────
 user_histories: dict[int, list[dict]] = defaultdict(list)
 user_models: dict[int, str] = defaultdict(lambda: DEFAULT_MODEL)
 user_memory_loaded: dict[int, bool] = defaultdict(bool)
+
+
+# ═══════════════════════════════════════════════════════════
+#  SQLite 數據庫操作
+# ═══════════════════════════════════════════════════════════
+def init_database() -> None:
+    """初始化 SQLite 數據庫，建立記憶表。"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                category TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+        logger.info("SQLite 數據庫已初始化")
+    except Exception as e:
+        logger.error("初始化數據庫失敗：%s", e)
+
+
+def save_memory(project_name: str, summary: str, category: str) -> bool:
+    """將記憶存入 SQLite 數據庫。"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO ai_memory (project_name, summary, category)
+            VALUES (?, ?, ?)
+            """,
+            (project_name, summary, category),
+        )
+        conn.commit()
+        conn.close()
+        logger.info("記憶已保存：%s - %s (%s)", project_name, summary[:30], category)
+        return True
+    except Exception as e:
+        logger.error("保存記憶失敗：%s", e)
+        return False
+
+
+def get_recent_memories(limit: int = 20) -> list[dict]:
+    """從 SQLite 讀取最近嘅記憶。"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, project_name, summary, category, created_at
+            FROM ai_memory
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        memories = []
+        for row in rows:
+            memories.append(
+                {
+                    "id": row[0],
+                    "project_name": row[1],
+                    "summary": row[2],
+                    "category": row[3],
+                    "created_at": row[4],
+                }
+            )
+        return memories
+    except Exception as e:
+        logger.error("讀取記憶失敗：%s", e)
+        return []
+
+
+def clear_all_memories() -> bool:
+    """清除所有記憶。"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM ai_memory")
+        conn.commit()
+        conn.close()
+        logger.info("所有記憶已清除")
+        return True
+    except Exception as e:
+        logger.error("清除記憶失敗：%s", e)
+        return False
+
+
+def format_memories_for_prompt(memories: list[dict]) -> str:
+    """將記憶格式化成可加入 system prompt 嘅文本。"""
+    if not memories:
+        return ""
+
+    formatted = "\n\n=== 最近嘅 AI 記憶（自動總結）===\n"
+    for mem in reversed(memories):  # 反轉以顯示時間順序
+        date_str = mem["created_at"].split(" ")[0]  # 只取日期部分
+        formatted += f"• [{date_str}] {mem['project_name']} ({mem['category']}): {mem['summary']}\n"
+
+    return formatted
+
+
+# ═══════════════════════════════════════════════════════════
+#  AI 對話總結功能
+# ═══════════════════════════════════════════════════════════
+def summarize_conversation(user_id: int) -> tuple[str, str, str]:
+    """
+    用 AI 自動總結當前對話，返回 (summary, project_name, category)。
+    如果無法總結，返回 ("", "", "")。
+    """
+    if not user_histories[user_id]:
+        return "", "", ""
+
+    # 取最後 10 條訊息作為總結對象
+    recent_messages = user_histories[user_id][-10:]
+
+    # 構建總結提示
+    conversation_text = "\n".join(
+        [f"{msg['role'].upper()}: {msg['content'][:200]}" for msg in recent_messages]
+    )
+
+    summarize_prompt = f"""你係一個對話總結助手。分析以下對話，提取關鍵信息。
+
+對話內容：
+{conversation_text}
+
+請按照以下格式返回 JSON（唔好包含任何其他文本）：
+{{
+    "summary": "30-50 字嘅總結，只記錄決策、變更、新需求、下一步行動。如果係閒聊或重複內容，返回空字符串",
+    "project": "涉及嘅項目名稱（Tryme、NIS、RDDR、EDYD 之一），如果無相關項目返回空字符串",
+    "category": "記憶類別（decision、change、requirement、action），如果無法分類返回空字符串"
+}}"""
+
+    try:
+        payload = {
+            "model": MODELS["glm"]["id"],
+            "messages": [{"role": "user", "content": summarize_prompt}],
+            "temperature": 0.3,
+            "max_tokens": 300,
+        }
+
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers=OPENROUTER_HEADERS,
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        response_text = data["choices"][0]["message"]["content"]
+
+        # 嘗試解析 JSON
+        try:
+            result = json.loads(response_text)
+            summary = result.get("summary", "").strip()
+            project = result.get("project", "").strip()
+            category = result.get("category", "").strip()
+
+            # 只有當有有效嘅摘要同類別時，先返回
+            if summary and category:
+                return summary, project, category
+            else:
+                return "", "", ""
+
+        except json.JSONDecodeError:
+            logger.warning("AI 返回嘅唔係有效 JSON：%s", response_text[:100])
+            return "", "", ""
+
+    except Exception as e:
+        logger.error("對話總結失敗：%s", e)
+        return "", "", ""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -125,10 +313,15 @@ def call_openrouter(user_id: int, user_message: str) -> str:
         user_histories[user_id] = user_histories[user_id][-MAX_HISTORY_MESSAGES:]
 
     # 如果已載入記憶，用完整 System Prompt；否則用簡短版
+    system_content = SYSTEM_PROMPT
     if user_memory_loaded[user_id]:
-        system_content = SYSTEM_PROMPT + "\n\n" + PROJECT_MEMORY
-    else:
-        system_content = SYSTEM_PROMPT
+        system_content += "\n\n" + PROJECT_MEMORY
+
+        # 加入 SQLite 記憶
+        recent_memories = get_recent_memories(20)
+        memories_text = format_memories_for_prompt(recent_memories)
+        if memories_text:
+            system_content += memories_text
 
     messages = [{"role": "system", "content": system_content}] + user_histories[user_id]
 
@@ -179,7 +372,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /opus — 切換到 Claude Opus 4\\.6（處理困難任務）\n"
         "• /memory — 載入項目記憶（討論項目前用）\n"
         "• /forget — 卸載項目記憶（加快回覆速度）\n"
+        "• /save — 手動總結當前對話並存入記憶\n"
+        "• /recall — 顯示最近 10 條記憶總結\n"
         "• /clear — 清除對話歷史，重新開始\n"
+        "• /delmemory — 清除所有記憶\n"
         "• /model — 查看而家用緊邊個模型\n"
         "• /help — 顯示呢個幫助訊息\n\n"
         "直接打字同我傾偈就得啦！🎉"
@@ -211,12 +407,18 @@ async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """載入項目記憶。"""
+    """載入項目記憶同 SQLite 記憶。"""
     user_id = update.effective_user.id
     user_memory_loaded[user_id] = True
+
+    # 讀取最近嘅記憶數量
+    recent_memories = get_recent_memories(20)
+    memory_count = len(recent_memories)
+
     await update.message.reply_text(
-        "🧠 項目記憶已載入！而家你可以用項目名稱（Tryme、NIS、RDDR、EDYD）同我討論。\n"
-        "傾完之後用 /forget 卸載記憶，回覆速度會快返。"
+        f"🧠 項目記憶已載入！而家你可以用項目名稱（Tryme、NIS、RDDR、EDYD）同我討論。\n"
+        f"已加載 {memory_count} 條自動記憶到對話上下文。\n"
+        f"傾完之後用 /forget 卸載記憶，回覆速度會快返。"
     )
 
 
@@ -228,6 +430,80 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "💨 項目記憶已卸載！回覆速度會快返。\n"
         "需要討論項目嘅時候，再用 /memory 載入就得。"
     )
+
+
+async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """手動觸發對話總結並存入記憶。"""
+    user_id = update.effective_user.id
+
+    if not user_histories[user_id]:
+        await update.message.reply_text("冇對話可以總結啦！先同我傾偈先。")
+        return
+
+    await update.message.chat.send_action("typing")
+
+    # 調用 AI 總結
+    summary, project_name, category = summarize_conversation(user_id)
+
+    if not summary:
+        await update.message.reply_text(
+            "呢個對話冇特別嘅內容值得記憶（可能係閒聊或重複內容）。"
+        )
+        return
+
+    # 如果冇偵測到項目名稱，用預設值
+    if not project_name:
+        project_name = "General"
+
+    # 存入數據庫
+    success = save_memory(project_name, summary, category)
+
+    if success:
+        await update.message.reply_text(
+            f"✅ 記憶已保存！\n"
+            f"項目：{project_name}\n"
+            f"類別：{category}\n"
+            f"摘要：{summary}"
+        )
+    else:
+        await update.message.reply_text("❌ 記憶保存失敗，請檢查數據庫連接。")
+
+
+async def cmd_recall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """顯示最近 10 條記憶總結（唔載入到 system prompt）。"""
+    recent_memories = get_recent_memories(10)
+
+    if not recent_memories:
+        await update.message.reply_text("冇記憶記錄。")
+        return
+
+    # 格式化顯示
+    message = "📚 *最近嘅記憶總結（最新 10 條）：*\n\n"
+    for mem in recent_memories:
+        date_str = mem["created_at"].split(" ")[0]
+        message += (
+            f"• [{date_str}] {mem['project_name']} "
+            f"({mem['category']})\n"
+            f"  {mem['summary']}\n\n"
+        )
+
+    if len(message) <= 4096:
+        await update.message.reply_text(message, parse_mode="MarkdownV2")
+    else:
+        # 分段發送
+        for i in range(0, len(message), 4096):
+            chunk = message[i : i + 4096]
+            await update.message.reply_text(chunk, parse_mode="MarkdownV2")
+
+
+async def cmd_delmemory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """清除所有記憶。"""
+    success = clear_all_memories()
+
+    if success:
+        await update.message.reply_text("🗑️ 所有記憶已清除！")
+    else:
+        await update.message.reply_text("❌ 清除記憶失敗，請檢查數據庫連接。")
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -290,19 +566,28 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     logger.info("二號龍蝦正在啟動...")
 
+    # 初始化數據庫
+    init_database()
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # 指令處理器
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("glm", cmd_glm))
     app.add_handler(CommandHandler("opus", cmd_opus))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("save", cmd_save))
+    app.add_handler(CommandHandler("recall", cmd_recall))
+    app.add_handler(CommandHandler("delmemory", cmd_delmemory))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("model", cmd_model))
 
+    # 文字訊息處理器
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # 錯誤處理器
     app.add_error_handler(error_handler)
 
     logger.info("二號龍蝦已經準備好，開始接收訊息！")
