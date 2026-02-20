@@ -119,7 +119,7 @@ def call_openrouter(user_id: int, user_message: str) -> str:
         return f"❌ API 出錯咗：{resp.status_code}。請檢查下你嘅 API Key 同模型設定。"
     except Exception as e:
         logger.error("OpenRouter unexpected error: %s", e)
-        return "❌ 出咗啲意外狀況，請遲啲再試下。"
+        return f"❌ 出咗啲意外狀況：{e}"
 
 
 # ═══════════════════════════════════════════════════════════
